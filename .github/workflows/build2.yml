@@ -1,0 +1,111 @@
+name: Build SubwayFakeDate Direct
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source
+        run: |
+          cat > FakeDate.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <CoreFoundation/CoreFoundation.h>
+          #import <objc/runtime.h>
+          #import <sys/time.h>
+          #import <time.h>
+
+          static const time_t fakeUnix = 1657368000;
+
+          static id fakeDate(id self, SEL cmd) {
+              return [NSDate dateWithTimeIntervalSince1970:fakeUnix];
+          }
+
+          static NSTimeInterval fakeReferenceDate(id self, SEL cmd) {
+              return fakeUnix - 978307200.0;
+          }
+
+          static void hookClassMethod(Class cls, SEL sel, IMP replacement) {
+              Method m = class_getClassMethod(cls, sel);
+              if (m) method_setImplementation(m, replacement);
+          }
+
+          static time_t fake_time(time_t *t) {
+              if (t) *t = fakeUnix;
+              return fakeUnix;
+          }
+
+          static int fake_gettimeofday(struct timeval *tv, void *tz) {
+              if (tv) {
+                  tv->tv_sec = fakeUnix;
+                  tv->tv_usec = 0;
+              }
+              return 0;
+          }
+
+          static CFAbsoluteTime fake_CFAbsoluteTimeGetCurrent(void) {
+              return (CFAbsoluteTime)fakeUnix - 978307200.0;
+          }
+
+          #define INTERPOSE(replacement, replacee) \
+          __attribute__((used)) static struct { \
+              const void *replacement; \
+              const void *replacee; \
+          } interpose_##replacee \
+          __attribute__((section("__DATA,__interpose"))) = { \
+              (const void *)&replacement, \
+              (const void *)&replacee \
+          };
+
+          INTERPOSE(fake_time, time)
+          INTERPOSE(fake_gettimeofday, gettimeofday)
+          INTERPOSE(fake_CFAbsoluteTimeGetCurrent, CFAbsoluteTimeGetCurrent)
+
+          __attribute__((constructor))
+          static void initFakeDate(void) {
+              @autoreleasepool {
+                  Class c = objc_getClass("NSDate");
+                  hookClassMethod(c, @selector(date), (IMP)fakeDate);
+
+                  if (class_getClassMethod(c, @selector(now))) {
+                      hookClassMethod(c, @selector(now), (IMP)fakeDate);
+                  }
+
+                  hookClassMethod(
+                      c,
+                      @selector(timeIntervalSinceReferenceDate),
+                      (IMP)fakeReferenceDate
+                  );
+              }
+          }
+          EOF
+
+      - name: Build dylib
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -miphoneos-version-min=13.0 \
+            -isysroot "$SDK" \
+            -framework Foundation \
+            -framework CoreFoundation \
+            FakeDate.m \
+            -o SubwayFakeDate.dylib
+
+          codesign -f -s - SubwayFakeDate.dylib
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubwayFakeDate-Direct
+          path: SubwayFakeDate.dylib
