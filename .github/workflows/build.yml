@@ -1,0 +1,47 @@
+name: Build SubwayFakeDate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Theos
+        uses: waruhachi/theos-action@v2.4.6
+        with:
+          theos-src: 'waruhachi/theos'
+          theos-branch: 'main'
+          sdks-src: 'waruhachi/sdks'
+          sdks-branch: 'main'
+          libgcuniversal: 'false'
+          altlist: 'false'
+
+      - name: Build
+        run: |
+          make clean
+          make FINALPACKAGE=1
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          DYLIB="$(find .theos -type f -name 'SubwayFakeDate.dylib' | head -n 1)"
+          if [ -z "$DYLIB" ]; then
+            echo "SubwayFakeDate.dylib was not found"
+            find .theos -maxdepth 6 -type f | sort
+            exit 1
+          fi
+          cp "$DYLIB" out/SubwayFakeDate.dylib
+          cp SubwayFakeDate.plist out/SubwayFakeDate.plist
+
+      - name: Upload ready files
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubwayFakeDate-LiveContainer
+          path: out/*
