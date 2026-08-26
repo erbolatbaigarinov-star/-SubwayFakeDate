@@ -1,0 +1,9 @@
+Package: com.local.subwayfakedate
+Name: SubwayFakeDate
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Makes the injected Subway Surfers process see 9 July 2022 while iOS keeps the real system date.
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: mobilesubstrate
