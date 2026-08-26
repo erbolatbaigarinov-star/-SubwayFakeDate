@@ -1,0 +1,216 @@
+name: Build SubwayFakeDate Fishhook
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source
+        run: |
+          cat > FakeDate.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <CoreFoundation/CoreFoundation.h>
+          #import <objc/runtime.h>
+          #import <mach-o/dyld.h>
+          #import <mach-o/loader.h>
+          #import <mach-o/nlist.h>
+          #import <sys/time.h>
+          #import <time.h>
+          #import <stdint.h>
+          #import <string.h>
+
+          static const time_t kFakeUnix = 1657368000; // 2022-07-09 12:00:00 UTC
+
+          // ---------- Objective-C hooks ----------
+          static id fakeNSDateDate(id self, SEL _cmd) {
+              return [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)kFakeUnix];
+          }
+
+          static id fakeNSDatenow(id self, SEL _cmd) {
+              return [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)kFakeUnix];
+          }
+
+          static NSTimeInterval fakeReferenceDate(id self, SEL _cmd) {
+              return (NSTimeInterval)kFakeUnix - 978307200.0;
+          }
+
+          static void HookClassMethod(Class cls, SEL sel, IMP replacement) {
+              Method m = class_getClassMethod(cls, sel);
+              if (m) method_setImplementation(m, replacement);
+          }
+
+          // ---------- C replacements ----------
+          static time_t fake_time(time_t *tloc) {
+              if (tloc) *tloc = kFakeUnix;
+              return kFakeUnix;
+          }
+
+          static int fake_gettimeofday(struct timeval *tv, void *tz) {
+              if (tv) {
+                  tv->tv_sec = kFakeUnix;
+                  tv->tv_usec = 0;
+              }
+              return 0;
+          }
+
+          static CFAbsoluteTime fake_CFAbsoluteTimeGetCurrent(void) {
+              return (CFAbsoluteTime)kFakeUnix - 978307200.0;
+          }
+
+          // ---------- Minimal symbol rebinding ----------
+          struct rebinding {
+              const char *name;
+              void *replacement;
+          };
+
+          static void rebind_section(struct rebinding *rebindings,
+                                     size_t rebindings_nel,
+                                     struct section_64 *section,
+                                     intptr_t slide,
+                                     struct symtab_command *symtab_cmd,
+                                     struct dysymtab_command *dysymtab_cmd,
+                                     struct segment_command_64 *linkedit_segment) {
+              uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
+              struct nlist_64 *symtab = (struct nlist_64 *)(linkedit_base + symtab_cmd->symoff);
+              char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+              uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+              uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
+              void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+
+              for (uint i = 0; i < section->size / sizeof(void *); i++) {
+                  uint32_t symtab_index = indirect_symbol_indices[i];
+                  if (symtab_index == INDIRECT_SYMBOL_ABS ||
+                      symtab_index == INDIRECT_SYMBOL_LOCAL ||
+                      symtab_index == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+                      continue;
+                  }
+
+                  uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
+                  char *symbol_name = strtab + strtab_offset;
+                  if (symbol_name[0] == '_') symbol_name++;
+
+                  for (size_t j = 0; j < rebindings_nel; j++) {
+                      if (strcmp(symbol_name, rebindings[j].name) == 0) {
+                          indirect_symbol_bindings[i] = rebindings[j].replacement;
+                          goto symbol_loop;
+                      }
+                  }
+              symbol_loop:;
+              }
+          }
+
+          static void rebind_image(const struct mach_header *header,
+                                   intptr_t slide,
+                                   struct rebinding *rebindings,
+                                   size_t rebindings_nel) {
+              if (header->magic != MH_MAGIC_64) return;
+
+              struct load_command *cur = (struct load_command *)((uintptr_t)header + sizeof(struct mach_header_64));
+              struct symtab_command *symtab_cmd = NULL;
+              struct dysymtab_command *dysymtab_cmd = NULL;
+              struct segment_command_64 *linkedit_segment = NULL;
+
+              for (uint i = 0; i < header->ncmds; i++, cur = (struct load_command *)((uintptr_t)cur + cur->cmdsize)) {
+                  if (cur->cmd == LC_SYMTAB) {
+                      symtab_cmd = (struct symtab_command *)cur;
+                  } else if (cur->cmd == LC_DYSYMTAB) {
+                      dysymtab_cmd = (struct dysymtab_command *)cur;
+                  } else if (cur->cmd == LC_SEGMENT_64) {
+                      struct segment_command_64 *seg = (struct segment_command_64 *)cur;
+                      if (strcmp(seg->segname, SEG_LINKEDIT) == 0) {
+                          linkedit_segment = seg;
+                      }
+                  }
+              }
+
+              if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment) return;
+
+              cur = (struct load_command *)((uintptr_t)header + sizeof(struct mach_header_64));
+              for (uint i = 0; i < header->ncmds; i++, cur = (struct load_command *)((uintptr_t)cur + cur->cmdsize)) {
+                  if (cur->cmd != LC_SEGMENT_64) continue;
+                  struct segment_command_64 *seg = (struct segment_command_64 *)cur;
+
+                  if (strcmp(seg->segname, SEG_DATA) != 0 &&
+                      strcmp(seg->segname, "__DATA_CONST") != 0 &&
+                      strcmp(seg->segname, "__AUTH_CONST") != 0) {
+                      continue;
+                  }
+
+                  struct section_64 *sect = (struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+                  for (uint j = 0; j < seg->nsects; j++) {
+                      uint32_t type = sect[j].flags & SECTION_TYPE;
+                      if (type == S_LAZY_SYMBOL_POINTERS || type == S_NON_LAZY_SYMBOL_POINTERS) {
+                          rebind_section(rebindings, rebindings_nel, &sect[j], slide,
+                                         symtab_cmd, dysymtab_cmd, linkedit_segment);
+                      }
+                  }
+              }
+          }
+
+          static struct rebinding g_rebindings[] = {
+              {"time", (void *)fake_time},
+              {"gettimeofday", (void *)fake_gettimeofday},
+              {"CFAbsoluteTimeGetCurrent", (void *)fake_CFAbsoluteTimeGetCurrent},
+          };
+
+          static void image_added(const struct mach_header *mh, intptr_t slide) {
+              rebind_image(mh, slide, g_rebindings, sizeof(g_rebindings) / sizeof(g_rebindings[0]));
+          }
+
+          __attribute__((constructor))
+          static void initFakeDate(void) {
+              @autoreleasepool {
+                  Class c = objc_getClass("NSDate");
+                  HookClassMethod(c, @selector(date), (IMP)fakeNSDateDate);
+                  if (class_getClassMethod(c, @selector(now))) {
+                      HookClassMethod(c, @selector(now), (IMP)fakeNSDatenow);
+                  }
+                  HookClassMethod(c, @selector(timeIntervalSinceReferenceDate), (IMP)fakeReferenceDate);
+
+                  // Rebind already-loaded images.
+                  uint32_t count = _dyld_image_count();
+                  for (uint32_t i = 0; i < count; i++) {
+                      rebind_image(_dyld_get_image_header(i),
+                                   _dyld_get_image_vmaddr_slide(i),
+                                   g_rebindings,
+                                   sizeof(g_rebindings) / sizeof(g_rebindings[0]));
+                  }
+
+                  // Rebind future images.
+                  _dyld_register_func_for_add_image(image_added);
+              }
+          }
+          EOF
+
+      - name: Build dylib
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -miphoneos-version-min=13.0 \
+            -isysroot "$SDK" \
+            -framework Foundation \
+            -framework CoreFoundation \
+            FakeDate.m \
+            -o SubwayFakeDate.dylib
+
+          codesign -f -s - SubwayFakeDate.dylib
+          file SubwayFakeDate.dylib
+          otool -L SubwayFakeDate.dylib
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubwayFakeDate-Fishhook
+          path: SubwayFakeDate.dylib
